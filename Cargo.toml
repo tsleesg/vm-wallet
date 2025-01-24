@@ -1,0 +1,22 @@
+[package]
+name = "vm_wallet"
+version = "0.1.0"
+edition = "2021"
+authors = ["TS <TS@ourown.ai>"]
+description = "PoC interaction with the CODE VM"
+
+[dependencies]
+solana-sdk = "1.17"
+solana-client = "1.17"
+code-vm-api = { git = "https://github.com/code-payments/code-vm.git", package = "code-vm-api", version = "0.1.0"}
+solana-curve25519 = "=2.0.13"
+
+
+# Serialization
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.134"
+serde_bytes = "0.11.15"
+
+# Time handling
+chrono = "0.4.39"
+bip39 = "2.1.0"
