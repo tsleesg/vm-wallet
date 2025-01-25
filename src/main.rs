@@ -3,207 +3,136 @@ use solana_sdk::{
     signer::Signer,
     signature::{Keypair, SeedDerivable},
     transaction::Transaction,
-    sysvar::{self, clock::Clock, Sysvar},
-    account_info::AccountInfo,
 };
-
 use solana_client::rpc_client::RpcClient;
 use code_vm_api::prelude::*;
+use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::instruction::create_associated_token_account;
 use std::{str::FromStr, fs};
-use serde::Deserialize;
-use chrono::{DateTime, NaiveDateTime, Utc};
-use bip39::Mnemonic;
-use std::io::{self, Write};
+use serde::{Deserialize, Serialize};
 
 const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-
-const VM_PROGRAM_ID: &str = "vmZ1WUq8SxjBWcaeTCvgJRZbS84R61uniFsQy5YMRTJ";
 const MINT_ADDRESS: &str = "kinXdEcpDQeHPEuQnqmUgtYykqKGVFq6CeVX5iAHJq6";
 const VM_STATE_ACCOUNT: &str = "FDrssd3RVeCkgHAT2NkEpkxC5UgfJpKHeebXUMnuzD6D";
 const VM_AUTHORITY: &str = "f1ipC31qd2u88MjNYp1T4Cc7rnWfM9ivYpTV1Z8FHnD";
-
 const LOCK_DURATION: u8 = 21;
 
-// PDA seeds
-const CODE_VM: &[u8] = b"code_vm";
-const VM_UNLOCK_ACCOUNT: &[u8] = b"vm_unlock_pda_account";
-
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct KeyFileFormat {
     #[serde(with = "serde_bytes")]
     private_key: Vec<u8>,
     pubkey: String,
 }
 
-struct UnlockContext {
+fn get_instance_hash() -> Result<Hash, Box<dyn std::error::Error>> {
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let hash_input = format!("instance_{}", current_time);
+    let mut hash_bytes = [0u8; 32];
+    let input_bytes = hash_input.as_bytes();
+    hash_bytes[..input_bytes.len().min(32)].copy_from_slice(&input_bytes[..input_bytes.len().min(32)]);
+    Ok(Hash::new_from_array(hash_bytes))}
+
+fn get_account_index() -> Result<u16, Box<dyn std::error::Error>> {
+    // In production this should be fetched from state management
+    Ok(0)
+}
+
+struct WithdrawContext {
     client: RpcClient,
-    program_id: Pubkey,
     vm_state: Pubkey,
     mint: Pubkey,
     vm_authority: Pubkey,
     owner: Keypair,
     payer: Keypair,
+    instance_hash: Hash,
+    account_index: u16,
+    vm_memory: Option<Pubkey>,
 }
 
-fn format_timestamp(timestamp: i64) -> String {
-    let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0)
-        .unwrap_or_default();
-    let datetime: DateTime<Utc> = DateTime::from_naive_utc_and_offset(naive, Utc);
-    datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
-}
-
-fn setup_owner_keypair() -> Result<(), Box<dyn std::error::Error>> {
-    print!("Enter your 12-word mnemonic phrase: ");
-    io::stdout().flush()?;
-    
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let phrase = input.trim();
-
-    // Validate mnemonic
-    let words: Vec<&str> = phrase.split_whitespace().collect();
-    if words.len() != 12 {
-        return Err("Mnemonic must be exactly 12 words".into());
-    }
-    
-    if phrase.chars().any(|c| !c.is_ascii_lowercase() && !c.is_whitespace()) {
-        return Err("Mnemonic can only contain lowercase letters and spaces".into());
-    }
-
-    // Generate keypair
-    let mnemonic = Mnemonic::parse_normalized(phrase)?;
-    let seed = mnemonic.to_seed("");
-    let keypair = Keypair::from_seed(&seed[..32])?;
-
-    // Format and save keypair
-    let private_key_vec = keypair.secret().to_bytes().to_vec();
-    let private_key_str = private_key_vec
-        .iter()
-        .map(|num| num.to_string())
-        .collect::<Vec<String>>()
-        .join(", ");
-
-    let formatted = format!(
-        "{{\n    \"private_key\": [{}],\n    \"pubkey\": \"{}\"\n}}",
-        private_key_str,
-        keypair.pubkey().to_string()
-    );
-
-    fs::write("owner_key.json", formatted)?;
-    println!("Keypair saved to owner_key.json");
-    Ok(())
-}
-
-impl UnlockContext {
+impl WithdrawContext {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             client: RpcClient::new(RPC_URL),
-            program_id: Pubkey::from_str(VM_PROGRAM_ID)?,
             vm_state: Pubkey::from_str(VM_STATE_ACCOUNT)?,
             mint: Pubkey::from_str(MINT_ADDRESS)?,
             vm_authority: Pubkey::from_str(VM_AUTHORITY)?,
             owner: load_keypair_from_file("owner_key.json")?,
             payer: load_keypair_from_file("payer_key.json")?,
+            instance_hash: get_instance_hash()?,
+            account_index: get_account_index()?,
+            vm_memory: None,
         })
     }
 
-    fn get_unlock_pda(&self) -> (Pubkey, u8) {
+    fn get_withdraw_pdas(&self) -> (Pubkey, Pubkey, Pubkey, u8) {
         let (timelock_address, _) = find_virtual_timelock_address(
             &self.mint,
             &self.vm_authority,
             &self.owner.pubkey(),
             LOCK_DURATION
         );
-    
-        find_unlock_address(
+
+        let (unlock_pda, _) = find_unlock_address(
             &self.owner.pubkey(),
             &timelock_address,
-            &self.vm_state  // Using renamed field
-        )
+            &self.vm_state
+        );
+
+        let (receipt_pda, receipt_bump) = find_withdraw_receipt_address(
+            &unlock_pda,
+            &self.instance_hash,
+            &self.vm_state
+        );
+
+        (timelock_address, unlock_pda, receipt_pda, receipt_bump)
     }
 
-    fn check_unlock_account(&self, unlock_pda: &Pubkey) -> Result<bool, Box<dyn std::error::Error>> {
-        match self.client.get_account(unlock_pda) {
-            Ok(_) => Ok(true),  // Account exists
-            Err(_) => Ok(false) // Account doesn't exist
+    fn verify_account_state(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let unlock_state = self.get_unlock_state()?;
+        if !unlock_state.is_unlocked() {
+            return Err("Account not unlocked".into());
         }
-    }    
-    
-    fn create_unlock_ix(&self, unlock_pda: &Pubkey) -> solana_sdk::instruction::Instruction {
-        timelock_unlock_init(
-            self.owner.pubkey(),
-            self.payer.pubkey(),
-            self.vm_state,  // Using renamed field
-            *unlock_pda
-        )
-    }
-
-    fn verify_unlock_pda(&self, unlock_pda: &Pubkey) -> Result<bool, Box<dyn std::error::Error>> {
-        let owner_pubkey = self.owner.pubkey();
-        let (timelock_address, _) = find_virtual_timelock_address(
-            &self.mint,
-            &self.vm_authority, 
-            &owner_pubkey,
-            LOCK_DURATION
-        );
-        
-        let seeds = &[
-            CODE_VM,
-            VM_UNLOCK_ACCOUNT,
-            owner_pubkey.as_ref(),
-            timelock_address.as_ref(),
-            self.vm_state.as_ref()
-        ];
-    
-        let (expected_pda, _) = Pubkey::find_program_address(seeds, &self.program_id);
-        
-        Ok(*unlock_pda == expected_pda)
-    }    
-
-    fn send_unlock_tx(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let (unlock_pda, _) = self.get_unlock_pda();
-        let ix = self.create_unlock_ix(&unlock_pda);
-        
-        // Print instruction details
-        println!("Instruction Data:");
-        println!("Program ID: {}", ix.program_id);
-        println!("Accounts:");
-        for (i, acc) in ix.accounts.iter().enumerate() {
-            println!("  {}: {} (is_signer: {}, is_writable: {})", 
-                i, acc.pubkey, acc.is_signer, acc.is_writable);
-        }
-        
-        let recent_blockhash = self.client.get_latest_blockhash()?;
-        println!("Derived Unlock PDA: {}", unlock_pda);
-        
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&self.payer.pubkey()),
-            &[&self.payer, &self.owner],
-            recent_blockhash
-        );
-    
-        let sig = self.client.send_and_confirm_transaction(&tx)?;
-        println!("Unlock transaction successful! Signature: {}", sig);
         Ok(())
     }
 
-    fn create_finalize_unlock_ix(&self, unlock_pda: &Pubkey) -> solana_sdk::instruction::Instruction {
-        timelock_unlock_finalize(
-            self.owner.pubkey(),
-            self.payer.pubkey(),
-            self.vm_state,
-            *unlock_pda
-        )
-    }
-
-    fn get_unlock_state(&self, unlock_pda: &Pubkey) -> Result<UnlockStateAccount, Box<dyn std::error::Error>> {
-        let account = self.client.get_account(unlock_pda)?;
+    fn get_unlock_state(&self) -> Result<UnlockStateAccount, Box<dyn std::error::Error>> {
+        let (_, unlock_pda, _, _) = self.get_withdraw_pdas();
+        let account = self.client.get_account(&unlock_pda)?;
         Ok(UnlockStateAccount::unpack(&account.data))
     }
 
-    fn send_finalize_unlock_tx(&self, unlock_pda: &Pubkey) -> Result<(), Box<dyn std::error::Error>> {
-        let ix = self.create_finalize_unlock_ix(unlock_pda);
+    fn create_withdraw_ix(
+        &self,
+        destination_ata: &Pubkey,
+    ) -> Result<solana_sdk::instruction::Instruction, Box<dyn std::error::Error>> {
+        let (_, unlock_pda, receipt_pda, _) = self.get_withdraw_pdas();
+        let vm = self.client.get_account(&self.vm_state)?;
+        let vm_data = CodeVmAccount::unpack(&vm.data);
+    
+        Ok(timelock_withdraw(
+            self.owner.pubkey(),
+            self.payer.pubkey(), 
+            self.vm_state,
+            Some(vm_data.omnibus.vault),
+            self.vm_memory,
+            None,                // vm_storage
+            None,               // deposit_pda
+            None,               // deposit_ata
+            unlock_pda,
+            Some(receipt_pda),
+            *destination_ata,   
+            WithdrawIxData::FromMemory { 
+                account_index: self.account_index 
+            }
+        ))
+    }     
+    
+    fn execute_withdraw(&self, destination_ata: &Pubkey) -> Result<(), Box<dyn std::error::Error>> {
+        self.verify_account_state()?;
+        
+        let ix = self.create_withdraw_ix(destination_ata)?;
         let recent_blockhash = self.client.get_latest_blockhash()?;
         
         let tx = Transaction::new_signed_with_payer(
@@ -213,91 +142,62 @@ impl UnlockContext {
             recent_blockhash
         );
 
-        let sig = self.client.send_and_confirm_transaction(&tx)?;
-        println!("Finalize unlock transaction successful! Signature: {}", sig);
+        let sig = self.client.send_and_confirm_transaction_with_spinner(&tx)?;
+        println!("Withdrawal successful!\nTransaction: https://solscan.io/tx/{}", sig);
+        
         Ok(())
     }
-
-    fn wait_for_unlock(&self, unlock_pda: &Pubkey) -> Result<(), Box<dyn std::error::Error>> {
-        loop {
-            let unlock_state = self.get_unlock_state(unlock_pda)?;
-            
-            if unlock_state.is_unlocked() {
-                println!("Account is already unlocked!");
-                return Ok(());
-            }
-
-            if !unlock_state.is_waiting() {
-                return Err("Invalid unlock state".into());
-            }
-
-            let clock_account = self.client.get_account(&sysvar::clock::id())?;
-            let mut lamports = clock_account.lamports;
-            let mut data = clock_account.data.clone();
-            let current_time = Clock::from_account_info(&AccountInfo::new(
-                &sysvar::clock::id(),
-                false,
-                false,
-                &mut lamports,
-                &mut data,
-                &clock_account.owner,
-                clock_account.executable,
-                clock_account.rent_epoch,
-            ))?.unix_timestamp;            
-
-            if current_time >= unlock_state.unlock_at {
-                println!("Timelock duration has passed, proceeding with finalization");
-                return self.send_finalize_unlock_tx(unlock_pda);
-            }
-
-            println!(
-                "Waiting for timelock...\nCurrent time: {} ({})\nUnlock at: {} ({})", 
-                current_time, format_timestamp(current_time),
-                unlock_state.unlock_at, format_timestamp(unlock_state.unlock_at)
-            );
-            std::thread::sleep(std::time::Duration::from_secs(60));
-        }
-    }
-    
 }
 
 fn load_keypair_from_file(path: &str) -> Result<Keypair, Box<dyn std::error::Error>> {
     let file_content = fs::read_to_string(path)?;
     let stored: KeyFileFormat = serde_json::from_str(&file_content)?;
     let seed: [u8; 32] = stored.private_key.try_into()
-        .expect("Invalid private key length");
+        .map_err(|_| "Invalid private key length")?;
     Ok(Keypair::from_seed(&seed)?)
 }
 
+fn setup_destination_ata(
+    context: &WithdrawContext
+) -> Result<Pubkey, Box<dyn std::error::Error>> {
+    let destination = get_associated_token_address(
+        &context.owner.pubkey(),
+        &context.mint
+    );
+
+    if context.client.get_account(&destination).is_err() {
+        let ix = create_associated_token_account(
+            &context.payer.pubkey(),
+            &context.owner.pubkey(),
+            &context.mint,
+            &solana_sdk::system_program::ID  // Add system program ID
+        );
+
+        let recent_blockhash = context.client.get_latest_blockhash()?;
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&context.payer.pubkey()),
+            &[&context.payer],
+            recent_blockhash
+        );
+
+        context.client.send_and_confirm_transaction(&tx)?;
+    }
+
+    Ok(destination)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // First check if owner_key.json exists
-    if !std::path::Path::new("owner_key.json").exists() {
-        setup_owner_keypair()?;
-    }
+    let context = WithdrawContext::new()?;    
+    println!("Initializing withdrawal process...");
+    println!("Owner: {}", context.owner.pubkey());
     
-    let context = UnlockContext::new()?;
+    let destination_ata = setup_destination_ata(&context)?;
+    println!("Destination ATA: {}", destination_ata);
     
-    // Get and verify the PDA
-    let (unlock_pda, _) = context.get_unlock_pda();
-    if !context.verify_unlock_pda(&unlock_pda)? {
-        println!("PDA verification failed!");
-        return Ok(());
-    }
+    println!("Executing withdrawal...");
+    context.execute_withdraw(&destination_ata)?;
     
-    println!("PDA verification passed, checking unlock status...");
-
-    // Check if unlock account exists before initializing
-    if context.check_unlock_account(&unlock_pda)? {
-        println!("Unlock account already initialized, proceeding to wait for unlock");
-        context.wait_for_unlock(&unlock_pda)?;
-    } else {
-        println!("Initializing new unlock...");
-        context.send_unlock_tx()?;
-        println!("Unlock initialized, waiting for timelock duration...");
-        context.wait_for_unlock(&unlock_pda)?;
-    }
-
-    println!("Unlock process completed successfully!");
+    println!("Withdrawal completed successfully!");
     Ok(())
 }
